@@ -1,0 +1,746 @@
+# Initialize runner temporary paths after the exact source checkout.
+# Called only by this builder repository's reviewed build.yml.
+# Omitting cache-mode here inherits the caller's explicit platform-enforced cap.
+name: CM native GNU Linux recipe
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      builder_repository:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
+      cache_epoch:
+        required: true
+        type: string
+      cache_mode:
+        required: true
+        type: string
+      consumer_required:
+        required: true
+        type: boolean
+      distribution_required:
+        required: false
+        type: boolean
+        default: false
+      build_kind:
+        required: true
+        type: string
+      host_origin:
+        required: false
+        type: string
+      reuse_run_id:
+        required: false
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.linux-x64.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.artifact_digest }}
+      input_artifact_id:
+        value: ${{ jobs.linux-x64.outputs.input_artifact_id }}
+      input_artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.input_artifact_digest }}
+      production_origin:
+        value: ${{ jobs.linux-x64.outputs.production_origin }}
+      validation_artifact_id:
+        value: ${{ jobs.linux-x64.outputs.validation_artifact_id }}
+      validation_artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.validation_artifact_digest }}
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: cm-source
+
+jobs:
+  linux-x64:
+    name: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    concurrency:
+      group: ${{ inputs.cache_mode == 'write' && 'cm-repository-cache-writer' || format('cm-cache-reader-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.request_id) }}
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      artifact_id: ${{ steps.reuse.outputs.artifact_id || steps.payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.reuse.outputs.artifact_digest || steps.payload.outputs.artifact-digest }}
+      input_artifact_id: ${{ steps.reuse.outputs.input_artifact_id || steps.runtime-inputs.outputs.artifact-id }}
+      input_artifact_digest: ${{ steps.reuse.outputs.input_artifact_digest || steps.runtime-inputs.outputs.artifact-digest }}
+      production_origin: ${{ steps.validation.outputs.production_origin }}
+      validation_artifact_id: ${{ steps.validation-upload.outputs.artifact-id }}
+      validation_artifact_digest: ${{ steps.validation-upload.outputs.artifact-digest }}
+    env:
+      CM_PLATFORM: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
+      CM_TARGET: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+      CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
+      CM_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      CM_SOURCE_SHA: ${{ inputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ inputs.builder_repository }}
+      CM_EXECUTION_ROLE: platform_builder
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_BUILD_KIND: ${{ inputs.build_kind }}
+      CM_HOST_ORIGIN: ${{ inputs.host_origin }}
+      CM_CACHE_MODE: ${{ inputs.cache_mode }}
+      CM_CACHE_EPOCH: ${{ inputs.cache_epoch }}
+      CM_CI_CONFIG: .github/cm-ci.json
+      PYTHONDONTWRITEBYTECODE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_CACHE_SIZE: 8G
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_BASEDIRS: ${{ github.workspace }}/cm-source
+    steps:
+      - name: Checkout trusted worker infrastructure at its exact workflow revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact CM source from the sole source repository
+        id: source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set runner temporary paths after source checkout
+        run: |
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/cm-cargo-home"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cm-target"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
+            echo "CM_HOST_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-host-build-cache"
+            echo "CM_ACCEPTANCE_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-acceptance-build-cache"
+            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-${CM_PLATFORM}-evidence"
+            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-${CM_PLATFORM}-artifacts"
+            echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
+            echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer"
+            echo "CM_TEST_BUILD_DIR=$RUNNER_TEMP/cm-test-builds"
+            echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs"
+            echo "CM_WORKER_POLICY_DIR=$GITHUB_WORKSPACE/.cm-worker/.github/scripts"
+          } >> "$GITHUB_ENV"
+      - name: Verify source SHA and platform-enforced cache authority
+        id: policy
+        uses: ./.cm-worker/.github/actions/cache-authority
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+      - name: Record source identity separately from worker identity
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Reuse exact completed producer before installing or compiling
+        id: reuse
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          CM_REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/retry.py" plan
+      - name: Restore exact successful qualification without executing requested source
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/worker_policy.py" restore-origin
+      - name: Configure the independent Mod-only toolchain
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B ci/scripts/mod_author.py configure
+      - name: Materialize exact upstream and the reviewed Host overlay
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: python3 -B ci/scripts/host.py prepare 2>&1 | tee "$CM_CI_LOG_DIR/host-prepare.log"
+      - name: Require real current-task mappings
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
+      - name: Check current independent case fingerprints before expensive work
+        if: inputs.consumer_required && inputs.build_kind == 'qualification'
+        run: |
+          python3 -B ci/scripts/retry.py self-check
+          python3 -B ci/scripts/acceptance_cache.py self-check
+          python3 -B ci/scripts/mod_author.py self-check
+          python3 -B ci/scripts/managed_package.py self-check
+          python3 -B ci/scripts/turn_budget.py self-check
+          python3 -B ci/scripts/review_before_send.py self-check
+          python3 -B ci/scripts/tool_concurrency.py self-check
+          python3 -B ci/scripts/runtime_qualification.py self-check
+          python3 -B ci/scripts/runtime_hooks.py self-check
+          python3 -B ci/scripts/runtime_upgrade.py self-check
+          python3 -B ci/scripts/sdk_seams.py self-check
+          if [[ -f ci/scripts/support_policy.py ]]; then
+            python3 -B ci/scripts/support_policy.py self-check
+          fi
+          if [[ -f ci/scripts/binary_index.py ]]; then
+            python3 -B ci/scripts/binary_index.py self-check
+          fi
+          if [[ '${{ inputs.distribution_required }}' == 'true' ]]; then
+            python3 -B ci/scripts/distribution_provenance.py self-check
+          fi
+          python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          import py_compile
+          import tempfile
+          import sys
+          sys.path.insert(0, "ci/scripts")
+          from mod_author import source_review
+          source_review(Path.cwd())
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+              for index, script in enumerate([*Path("ci/scripts").glob("*.py"), *Path("fixtures").rglob("*.py")]):
+                  py_compile.compile(str(script), cfile=str(Path(directory) / (str(index) + ".pyc")), doraise=True)
+          PY
+      - name: Free space for restored Rust caches and build outputs
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: |
+          df -h "$RUNNER_TEMP" | tee "$CM_CI_LOG_DIR/disk-before-cache.log"
+          # These preinstalled SDKs are unused by the reviewed Rust/Python recipe.
+          sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h "$RUNNER_TEMP" | tee -a "$CM_CI_LOG_DIR/disk-before-cache.log"
+      - name: Install exact reviewed Rust toolchain on the worker
+        if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
+      - name: Enable upstream-required user namespaces on this ephemeral CI runner
+        if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 | tee "$CM_CI_LOG_DIR/userns-setup.log"
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 | tee -a "$CM_CI_LOG_DIR/userns-setup.log"
+          fi
+      - name: Install required Linux native dependencies
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev libssl-dev bubblewrap
+          python3 -B ci/scripts/host.py native 2>&1 | tee "$CM_CI_LOG_DIR/native-inputs.log"
+      - name: Install pinned sccache
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true
+      - name: Identify compatible cache namespace inside this builder repository
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        id: cache-identity
+        run: python3 -B ci/scripts/linux_ci.py identity 2>&1 | tee "$CM_CI_LOG_DIR/cache-identity.log"
+      - name: Restore this worker repository's Cargo downloads
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry/index
+            ${{ env.CARGO_HOME }}/registry/cache
+            ${{ env.CARGO_HOME }}/git/db
+          key: ${{ steps.cache-identity.outputs.cargo_key }}
+          restore-keys: ${{ steps.cache-identity.outputs.cargo_prefix }}
+          enableCrossOsArchive: false
+      - name: Restore this worker repository's sccache snapshot
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        id: sccache-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache-identity.outputs.sccache_key }}
+          restore-keys: |
+            ${{ steps.cache-identity.outputs.sccache_prefix }}
+            ${{ steps.cache-identity.outputs.sccache_legacy_prefix }}
+          enableCrossOsArchive: false
+      - name: Start sccache after restoring its worker-local snapshot
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        id: sccache-start
+        run: |
+          sccache --start-server 2>&1 | tee "$CM_CI_LOG_DIR/sccache-start.log"
+          sccache --zero-stats
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-restored.json"
+      - name: Fetch locked dependencies
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: python3 -B ci/scripts/linux_ci.py fetch
+      - name: Audit all production Cargo licenses before native build work
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B ci/scripts/distribution_provenance.py cargo-audit 2>&1 | tee "$CM_CI_LOG_DIR/cargo-license-audit.log"
+      - name: Build and bind the bundled sandbox helper before Host compilation
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: |
+          python3 -B ci/scripts/host.py helper
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-helper.json"
+      - name: Generate current protocol and config schema assets before sealing Host sources
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B ci/scripts/host.py schemas
+      - name: Seal complete Host inputs and the compiled helper digest
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        id: host-identity
+        run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
+      - name: Check consumer observer before Host compilation
+        if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B ci/scripts/runtime_consumer.py self-check
+      - name: Check Host canonicalization and rejection before compiling
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
+      - name: Restore immutable base inputs for changed private probes
+        if: steps.reuse.outputs.probe_build_required == 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B ci/scripts/retry.py probe-prepare
+      - name: Seal exact acceptance compilation inputs and recipes
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        id: acceptance-identity
+        run: |
+          python3 -B ci/scripts/acceptance_cache.py self-check
+          python3 -B ci/scripts/acceptance_cache.py identity
+      - name: Restore compiled target host-core-baseline-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.host_core_baseline_build != ''
+        id: acceptance-host-core-baseline-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/host-core-baseline-build
+          key: ${{ steps.acceptance-identity.outputs.host_core_baseline_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-adapter-clippy
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_adapter_clippy != ''
+        id: acceptance-mod-adapter-clippy
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-adapter-clippy
+          key: ${{ steps.acceptance-identity.outputs.mod_adapter_clippy }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-host-abi-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_host_abi_probe_build != ''
+        id: acceptance-mod-host-abi-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-host-abi-probe-build
+          key: ${{ steps.acceptance-identity.outputs.mod_host_abi_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-pinned-snapshot-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_pinned_snapshot_build != ''
+        id: acceptance-mod-pinned-snapshot-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-pinned-snapshot-build
+          key: ${{ steps.acceptance-identity.outputs.mod_pinned_snapshot_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target m02-native-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.m02_native_probe_build != ''
+        id: acceptance-m02-native-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/m02-native-probe-build
+          key: ${{ steps.acceptance-identity.outputs.m02_native_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target review-tui-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.review_tui_probe_build != ''
+        id: acceptance-review-tui-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/review-tui-probe-build
+          key: ${{ steps.acceptance-identity.outputs.review_tui_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g03-local-backend-contract
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g03_local_backend_contract != ''
+        id: acceptance-g03-local-backend-contract
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
+          key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-v1
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_v1 != ''
+        id: acceptance-g06-sdk-a-v1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v1 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-v2
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_v2 != ''
+        id: acceptance-g06-sdk-a-v2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v2 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-replacement
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_replacement != ''
+        id: acceptance-g06-sdk-a-replacement
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_replacement }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-v1
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_v1 != ''
+        id: acceptance-g06-sdk-b-v1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v1 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-v2
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_v2 != ''
+        id: acceptance-g06-sdk-b-v2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v2 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-replacement
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_replacement != ''
+        id: acceptance-g06-sdk-b-replacement
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_replacement }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-c-abi
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_c_abi != ''
+        id: acceptance-g06-c-abi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-c-abi
+          key: ${{ steps.acceptance-identity.outputs.g06_c_abi }}
+          enableCrossOsArchive: false
+      - name: Restore verified legacy snapshot for one-time target migration
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true' && (steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' || steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' || steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' || steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' || steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' || steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' || steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/legacy
+          key: ${{ steps.acceptance-identity.outputs.legacy_acceptance_key }}
+          enableCrossOsArchive: false
+      - name: Verify acceptance executable bytes inputs and original producer
+        id: acceptance-cache-verified
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: python3 -B ci/scripts/acceptance_cache.py restore
+      - name: Restore exact product-input Host binaries and original build evidence
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        id: host-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
+          key: ${{ steps.host-identity.outputs.host_key }}
+          enableCrossOsArchive: false
+      - name: Verify restored Host bytes identity and original producer
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B ci/scripts/host.py cache-restore
+      - name: Check test and build only mapped current-task packages
+        id: host-quality
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: |
+          python3 -B ci/scripts/linux_ci.py build-test
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-host.json"
+      - name: Capture verified Host build before Python acceptance
+        id: host-cache-prepare
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-quality.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
+        run: python3 -B ci/scripts/host.py cache-save
+      - name: Restore the qualified legacy Host reference for metadata rejection
+        if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B ci/scripts/turn_budget.py restore-legacy
+          python3 -B ci/scripts/review_before_send.py restore-reference
+          python3 -B ci/scripts/runtime_upgrade.py restore-reference --producer
+      - name: Run actual acceptance for the current mapped task
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B ci/scripts/linux_ci.py acceptance
+      - name: Build only changed private probes against the frozen product
+        id: probe-build
+        if: steps.reuse.outputs.probe_build_required == 'true'
+        run: python3 -B ci/scripts/retry.py probe-build
+      - name: Build only the current author Mod with actual compiler execution evidence
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential strace
+          status=0
+          strace -f -qq -s 16384 -e trace=execve,execveat -o "$CM_CI_LOG_DIR/m05-author-exec.log" python3 -B ci/scripts/mod_author.py produce || status=$?
+          CM_AUTHOR_BUILD_EXIT="$status" python3 -B ci/scripts/mod_author.py audit-mod-only
+      - name: Verify independently completed acceptance targets
+        id: acceptance-cache-prepare
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && steps.acceptance-cache-verified.outcome == 'success' }}
+        run: python3 -B ci/scripts/acceptance_cache.py save
+      - name: Capture compiler statistics and stop before archiving
+        id: cache-stop
+        if: ${{ always() && steps.sccache-start.outcome == 'success' }}
+        run: |
+          set +e
+          sccache --show-stats > "$CM_CI_LOG_DIR/sccache-stats.txt" 2> "$CM_CI_LOG_DIR/sccache-stats.stderr"
+          stats_status=$?
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-stats.json" 2> "$CM_CI_LOG_DIR/sccache-stats-json.stderr"
+          json_status=$?
+          sccache --stop-server > "$CM_CI_LOG_DIR/sccache-stop.log" 2>&1
+          stop_status=$?
+          cat "$CM_CI_LOG_DIR/sccache-stats.txt"
+          if (( stats_status != 0 || json_status != 0 || stop_status != 0 )); then exit 1; fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          stats = json.loads((Path(os.environ["CM_CI_LOG_DIR"]) / "sccache-stats.json").read_text())
+          new_entries = stats["stats"]["cache_writes"]
+          assert type(new_entries) is int and new_entries >= 0, "Invalid sccache cache_writes"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"has_new_entries={str(new_entries > 0).lower()}\n")
+          print(f"Successful new compiler cache entries: {new_entries}")
+          PY
+      - name: Record final identity and cache observations
+        if: ${{ always() && steps.policy.outcome == 'success' }}
+        env:
+          CM_JOB_STATUS: ${{ job.status }}
+          CM_CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CM_CARGO_CACHE_MATCH: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+          CM_SCCACHE_ARCHIVE_HIT: ${{ steps.sccache-cache.outputs.cache-hit }}
+          CM_SCCACHE_ARCHIVE_MATCH: ${{ steps.sccache-cache.outputs.cache-matched-key }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Upload actual current-task artifacts
+        id: payload
+        if: ${{ success() && steps.reuse.outputs.reused != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only original distribution materials
+        if: ${{ success() && inputs.distribution_required && steps.reuse.outputs.reused != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-distribution-materials-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}/distribution
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload exact frozen runtime inputs for the separate consumer
+        id: runtime-inputs
+        if: ${{ success() && inputs.consumer_required && steps.reuse.outputs.reused != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-runtime-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CONSUMER_TRANSFER_DIR }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only the changed Core test build
+        id: core-probe-upload
+        if: steps.probe-build.outputs.core_probe == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-m02-native-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/m02-native-probe-build
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only the changed TUI test build
+        id: tui-probe-upload
+        if: steps.probe-build.outputs.tui_probe == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-review-tui-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/review-tui-probe-build
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-a-v1 bytes and build receipt
+        id: g06-sdk-a-v1-upload
+        if: steps.probe-build.outputs.g06_sdk_a_v1 == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-v1
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-a-v2 bytes and build receipt
+        id: g06-sdk-a-v2-upload
+        if: steps.probe-build.outputs.g06_sdk_a_v2 == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-v2
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-a-replacement bytes and build receipt
+        id: g06-sdk-a-replacement-upload
+        if: steps.probe-build.outputs.g06_sdk_a_replacement == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-replacement
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-b-v1 bytes and build receipt
+        id: g06-sdk-b-v1-upload
+        if: steps.probe-build.outputs.g06_sdk_b_v1 == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-v1
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-b-v2 bytes and build receipt
+        id: g06-sdk-b-v2-upload
+        if: steps.probe-build.outputs.g06_sdk_b_v2 == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-v2
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only changed g06-sdk-b-replacement bytes and build receipt
+        id: g06-sdk-b-replacement-upload
+        if: steps.probe-build.outputs.g06_sdk_b_replacement == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-replacement
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare current tests separately from the original frozen product
+        if: inputs.consumer_required
+        id: validation
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          CM_CORE_PROBE_ARTIFACT_ID: ${{ steps.core-probe-upload.outputs.artifact-id }}
+          CM_TUI_PROBE_ARTIFACT_ID: ${{ steps.tui-probe-upload.outputs.artifact-id }}
+          CM_G06_SDK_A_V1_ARTIFACT_ID: ${{ steps.g06-sdk-a-v1-upload.outputs.artifact-id }}
+          CM_G06_SDK_A_V2_ARTIFACT_ID: ${{ steps.g06-sdk-a-v2-upload.outputs.artifact-id }}
+          CM_G06_SDK_A_REPLACEMENT_ARTIFACT_ID: ${{ steps.g06-sdk-a-replacement-upload.outputs.artifact-id }}
+          CM_G06_SDK_B_V1_ARTIFACT_ID: ${{ steps.g06-sdk-b-v1-upload.outputs.artifact-id }}
+          CM_G06_SDK_B_V2_ARTIFACT_ID: ${{ steps.g06-sdk-b-v2-upload.outputs.artifact-id }}
+          CM_G06_SDK_B_REPLACEMENT_ARTIFACT_ID: ${{ steps.g06-sdk-b-replacement-upload.outputs.artifact-id }}
+          CM_CURRENT_ARTIFACT_ID: ${{ steps.payload.outputs.artifact-id }}
+          CM_CURRENT_INPUT_ARTIFACT_ID: ${{ steps.runtime-inputs.outputs.artifact-id }}
+        run: python3 -B ci/scripts/retry.py overlay
+      - name: Upload only current runtime tests and exact origin references
+        if: inputs.consumer_required
+        id: validation-upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_VALIDATION_INPUT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save successful trusted source Cargo downloads
+        if: ${{ success() && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry/index
+            ${{ env.CARGO_HOME }}/registry/cache
+            ${{ env.CARGO_HOME }}/git/db
+          key: ${{ steps.cache-identity.outputs.cargo_key }}
+      - name: Save new successful compiler entries from this trusted source
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cache-stop.outcome == 'success' && steps.cache-stop.outputs.has_new_entries == 'true' && steps.sccache-cache.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache-identity.outputs.sccache_key }}
+      - name: Save successful trusted source Host binaries and original build checks
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache-prepare.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
+          key: ${{ steps.host-identity.outputs.host_key }}
+      - name: Save successful compiled target host-core-baseline-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_host_core_baseline_build == 'true' && steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/host-core-baseline-build
+          key: ${{ steps.acceptance-identity.outputs.host_core_baseline_build }}
+      - name: Save successful compiled target mod-adapter-clippy
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_adapter_clippy == 'true' && steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-adapter-clippy
+          key: ${{ steps.acceptance-identity.outputs.mod_adapter_clippy }}
+      - name: Save successful compiled target mod-host-abi-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_host_abi_probe_build == 'true' && steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-host-abi-probe-build
+          key: ${{ steps.acceptance-identity.outputs.mod_host_abi_probe_build }}
+      - name: Save successful compiled target mod-pinned-snapshot-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_pinned_snapshot_build == 'true' && steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-pinned-snapshot-build
+          key: ${{ steps.acceptance-identity.outputs.mod_pinned_snapshot_build }}
+      - name: Save successful compiled target m02-native-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_m02_native_probe_build == 'true' && steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/m02-native-probe-build
+          key: ${{ steps.acceptance-identity.outputs.m02_native_probe_build }}
+      - name: Save successful compiled target review-tui-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_review_tui_probe_build == 'true' && steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/review-tui-probe-build
+          key: ${{ steps.acceptance-identity.outputs.review_tui_probe_build }}
+      - name: Save successful compiled target g03-local-backend-contract
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g03_local_backend_contract == 'true' && steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
+          key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
+      - name: Save successful compiled target g06-sdk-a-v1
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v1 == 'true' && steps.acceptance-g06-sdk-a-v1.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v1 }}
+      - name: Save successful compiled target g06-sdk-a-v2
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v2 == 'true' && steps.acceptance-g06-sdk-a-v2.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v2 }}
+      - name: Save successful compiled target g06-sdk-a-replacement
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_replacement == 'true' && steps.acceptance-g06-sdk-a-replacement.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_replacement }}
+      - name: Save successful compiled target g06-sdk-b-v1
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v1 == 'true' && steps.acceptance-g06-sdk-b-v1.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v1 }}
+      - name: Save successful compiled target g06-sdk-b-v2
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v2 == 'true' && steps.acceptance-g06-sdk-b-v2.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v2 }}
+      - name: Save successful compiled target g06-sdk-b-replacement
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_replacement == 'true' && steps.acceptance-g06-sdk-b-replacement.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_replacement }}
+      - name: Save successful compiled target g06-c-abi
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_c_abi == 'true' && steps.acceptance-g06-c-abi.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-c-abi
+          key: ${{ steps.acceptance-identity.outputs.g06_c_abi }}
+      - name: Upload logs compiler statistics and source/worker identities
+        if: ${{ always() && steps.policy.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-${{ env.CM_PLATFORM }}-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_LOG_DIR }}
+          if-no-files-found: error
+          retention-days: 14
